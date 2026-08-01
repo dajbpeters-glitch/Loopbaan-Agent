@@ -1,29 +1,22 @@
-# Loopbaan\-Agent 3\.0\.2
+Loopbaan-Agent 3.0.3
 
-Rate\-limit\-veilige multi\-source search\.
+Gerichte verbetering van vacature-import.
 
-## Verbeteringen
+Nieuw
 
-- Adzuna gebruikt maximaal vijf zoektermen per zoekactie\.
-- Adzuna\-verzoeken lopen sequentieel met 2,6 seconden ertussen\.
-- Bij HTTP 429 stopt alleen Adzuna; Jooble gaat door\.
-- Bij tijdelijke 5xx\-fouten doet Adzuna maximaal één rustige retry\.
-- Jooble zoekt onafhankelijk en beperkt parallel\.
-- Technische URL’s, queryparameters en API\-sleutels verschijnen niet meer in foutmeldingen\.
-- Zoekdiagnostiek is leesbaar en toont geen ruwe JSON\.
-- Knop om de zoekcache handmatig te wissen\.
+• functietitel, organisatie en locatie worden bij PDF-, DOCX- en TXT-upload automatisch uitgelezen;
+• de extractie gebeurt één keer per uniek bestand en veroorzaakt niet bij iedere rerun nieuwe AI-kosten;
+• een betrouwbaarheidsindicatie maakt duidelijk of controle nodig is;
+• de automatisch ingevulde velden blijven handmatig bewerkbaar;
+• een knop Lees gegevens opnieuw uit is beschikbaar;
+• bestandsextensies worden niet meer als onderdeel van de functietitel opgeslagen.
 
-## Updaten vanaf 3\.0\.1
+Updaten vanaf 3.0.2
 
 Vervang:
 
-- `app.py`
-- `sources.py`
-- `README.md`
+• app.py
+• ai_engine.py
+• README.md
 
-De overige bestanden blijven gelijk\.
-
-## Belangrijk
-
-Wanneer een API\-sleutel eerder zichtbaar is geworden in een screenshot of log,
-vervang die sleutel bij de betreffende aanbieder en werk Streamlit Secrets bij\.
+De overige bestanden en secrets blijven gelijk.
