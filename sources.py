@@ -1,7 +1,10 @@
 import hashlib
 import json
+import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import unescape
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 import streamlit as st
@@ -17,15 +20,45 @@ def secret(name, default=None):
         return default
 
 
+def safe_error(exc):
+    """Maak een foutmelding geschikt voor de interface zonder secrets of URL-query."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+
+    if status == 429:
+        return "Tijdelijk begrensd door de bron. Probeer later opnieuw."
+    if status in {500, 502, 503, 504}:
+        return "Bron tijdelijk niet beschikbaar."
+    if status in {401, 403}:
+        return "Toegang geweigerd. Controleer de API-sleutel."
+    if isinstance(exc, requests.Timeout):
+        return "Bron reageerde niet binnen de wachttijd."
+    if isinstance(exc, requests.ConnectionError):
+        return "Verbinding met de bron is mislukt."
+
+    message = str(exc)
+    # Verwijder URLs, querystrings en bekende secretwaarden.
+    message = re.sub(r"https?://\S+", "[URL verborgen]", message)
+    for name in ["ADZUNA_APP_ID", "ADZUNA_APP_KEY", "JOOBLE_API_KEY"]:
+        value = secret(name)
+        if value:
+            message = message.replace(str(value), "[verborgen]")
+    return message[:180] or "Onbekende bronfout."
+
+
+class SourceSearchStopped(Exception):
+    """Interne melding dat een bron voor deze zoekactie moet stoppen."""
+
+
 class Adzuna:
     name = "Adzuna"
+    url = "https://api.adzuna.com/v1/api/jobs/nl/search/1"
 
     def available(self):
         return bool(secret("ADZUNA_APP_ID") and secret("ADZUNA_APP_KEY"))
 
     def search(self, term, location, radius, count):
         response = requests.get(
-            "https://api.adzuna.com/v1/api/jobs/nl/search/1",
+            self.url,
             params={
                 "app_id": secret("ADZUNA_APP_ID"),
                 "app_key": secret("ADZUNA_APP_KEY"),
@@ -111,64 +144,143 @@ class Jooble:
 
 @st.cache_data(ttl="6h", max_entries=500, show_spinner=False)
 def cached_source_search(source_name, term, location, radius, count):
-    source_map = {
-        "Adzuna": Adzuna(),
-        "Jooble": Jooble(),
-    }
+    source_map = {"Adzuna": Adzuna(), "Jooble": Jooble()}
     return source_map[source_name].search(term, location, radius, count)
 
 
 class SourceManager:
+    ADZUNA_MAX_TERMS = 5
+    ADZUNA_INTERVAL_SECONDS = 2.6
+
     def __init__(self):
         self.sources = [Adzuna(), Jooble()]
 
     def available(self):
         return [source for source in self.sources if source.available()]
 
-    def search(self, terms, location, radius, count, enabled):
-        """Zoek parallel per bron én zoekterm, met cache en diagnostiek."""
-        vacancies = []
-        diagnostics = {
-            source.name: {"gevonden": 0, "fouten": []}
-            for source in self.available()
-            if source.name in enabled
+    def _search_adzuna(self, terms, location, radius, count):
+        """Adzuna bewust sequentieel en begrensd om 429 te voorkomen."""
+        jobs = []
+        errors = []
+        used_terms = terms[: self.ADZUNA_MAX_TERMS]
+        status = "gereed"
+
+        for index, term in enumerate(used_terms):
+            if index:
+                time.sleep(self.ADZUNA_INTERVAL_SECONDS)
+
+            try:
+                items = cached_source_search(
+                    "Adzuna", term, location, radius, count
+                )
+                jobs.extend(items)
+            except requests.HTTPError as exc:
+                code = getattr(exc.response, "status_code", None)
+                if code == 429:
+                    errors.append(safe_error(exc))
+                    status = "begrensd"
+                    break
+                if code in {500, 502, 503, 504}:
+                    # Eén gecontroleerde retry na korte rust.
+                    time.sleep(3)
+                    try:
+                        items = cached_source_search(
+                            "Adzuna", term, location, radius, count
+                        )
+                        jobs.extend(items)
+                        continue
+                    except Exception as retry_exc:
+                        errors.append(safe_error(retry_exc))
+                        status = "tijdelijk niet beschikbaar"
+                        continue
+                errors.append(safe_error(exc))
+                status = "fout"
+            except Exception as exc:
+                errors.append(safe_error(exc))
+                status = "fout"
+
+        return jobs, {
+            "gevonden": len(jobs),
+            "status": status,
+            "zoektermen_gebruikt": len(used_terms),
+            "fouten": list(dict.fromkeys(errors)),
         }
 
-        tasks = [
-            (source.name, term)
-            for source in self.available()
-            if source.name in enabled
-            for term in terms
-        ]
+    def _search_jooble(self, terms, location, radius, count):
+        """Jooble mag beperkt parallel zoeken en blijft onafhankelijk werken."""
+        jobs = []
+        errors = []
 
-        if not tasks:
-            return vacancies, diagnostics
-
-        with ThreadPoolExecutor(max_workers=min(4, len(tasks))) as executor:
+        with ThreadPoolExecutor(max_workers=min(3, max(1, len(terms)))) as executor:
             future_map = {
                 executor.submit(
                     cached_source_search,
-                    source_name,
+                    "Jooble",
                     term,
                     location,
                     radius,
                     count,
-                ): (source_name, term)
-                for source_name, term in tasks
+                ): term
+                for term in terms
             }
 
             for future in as_completed(future_map):
-                source_name, term = future_map[future]
                 try:
-                    items = future.result()
-                    vacancies.extend(items)
-                    diagnostics[source_name]["gevonden"] += len(items)
+                    jobs.extend(future.result())
                 except Exception as exc:
-                    diagnostics[source_name]["fouten"].append(
-                        f"{term}: {exc}"
-                    )
+                    errors.append(safe_error(exc))
 
-        return vacancies, diagnostics
+        return jobs, {
+            "gevonden": len(jobs),
+            "status": "gereed" if not errors else "gedeeltelijk gelukt",
+            "zoektermen_gebruikt": len(terms),
+            "fouten": list(dict.fromkeys(errors)),
+        }
+
+    def search(self, terms, location, radius, count, enabled):
+        """Zoek bronnen onafhankelijk; uitval van één bron blokkeert de rest niet."""
+        jobs = []
+        diagnostics = {}
+        tasks = {}
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            if "Adzuna" in enabled and Adzuna().available():
+                tasks[
+                    executor.submit(
+                        self._search_adzuna,
+                        terms,
+                        location,
+                        radius,
+                        count,
+                    )
+                ] = "Adzuna"
+
+            if "Jooble" in enabled and Jooble().available():
+                tasks[
+                    executor.submit(
+                        self._search_jooble,
+                        terms,
+                        location,
+                        radius,
+                        count,
+                    )
+                ] = "Jooble"
+
+            for future in as_completed(tasks):
+                source_name = tasks[future]
+                try:
+                    source_jobs, source_diagnostics = future.result()
+                    jobs.extend(source_jobs)
+                    diagnostics[source_name] = source_diagnostics
+                except Exception as exc:
+                    diagnostics[source_name] = {
+                        "gevonden": 0,
+                        "status": "fout",
+                        "zoektermen_gebruikt": 0,
+                        "fouten": [safe_error(exc)],
+                    }
+
+        return jobs, diagnostics
 
 
 class JobPostingImporter:
@@ -176,9 +288,7 @@ class JobPostingImporter:
         response = requests.get(
             url,
             timeout=25,
-            headers={
-                "User-Agent": "Mozilla/5.0 Loopbaan-Agent/3.0.1"
-            },
+            headers={"User-Agent": "Mozilla/5.0 Loopbaan-Agent/3.0.2"},
         )
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
@@ -218,41 +328,47 @@ class JobPostingImporter:
 
         if not posting:
             raise ValueError(
-                "Geen JobPosting-gegevens gevonden. Upload of plak de "
-                "vacaturetekst."
+                "Geen JobPosting-gegevens gevonden. Plak de vacaturetekst "
+                "of upload een PDF/DOCX."
             )
 
         organisation = posting.get("hiringOrganization") or {}
-        location = posting.get("jobLocation") or {}
-        if isinstance(location, list):
-            location = location[0] if location else {}
-        address = location.get("address", {}) if isinstance(location, dict) else {}
-        description = clean_text(
-            BeautifulSoup(
-                unescape(posting.get("description", "")),
-                "html.parser",
-            ).get_text("\n")
-        )
+        location = self._location(posting.get("jobLocation"))
 
         return normalize_vacancy(
             {
                 "id": "url:"
-                + hashlib.sha256(url.encode()).hexdigest()[:16],
+                + hashlib.sha256(url.encode("utf-8")).hexdigest()[:16],
                 "title": posting.get("title", ""),
                 "organisation": organisation.get("name", ""),
-                "location": ", ".join(
-                    str(address.get(field))
-                    for field in [
-                        "addressLocality",
-                        "addressRegion",
-                        "addressCountry",
-                    ]
-                    if address.get(field)
+                "location": location,
+                "description": self._html_to_text(
+                    posting.get("description", "")
                 ),
-                "description": description,
                 "url": url,
                 "source": "Vacaturelink",
                 "date_posted": posting.get("datePosted", ""),
                 "valid_through": posting.get("validThrough", ""),
             }
         )
+
+    @staticmethod
+    def _html_to_text(value):
+        soup = BeautifulSoup(unescape(value or ""), "html.parser")
+        return clean_text(soup.get_text("\n"))
+
+    @staticmethod
+    def _location(value):
+        if isinstance(value, list):
+            value = value[0] if value else {}
+        if not isinstance(value, dict):
+            return ""
+        address = value.get("address") or {}
+        if not isinstance(address, dict):
+            return ""
+        parts = [
+            address.get("addressLocality"),
+            address.get("addressRegion"),
+            address.get("addressCountry"),
+        ]
+        return ", ".join(str(part) for part in parts if part)
